@@ -3,7 +3,7 @@
 
 # xyOps Active Directory Groups Event Plugin
 
-[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)](https://github.com/xyOps/xyOps-AD-Groups)
+[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)](https://github.com/talder/xyOps-AD-Groups)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE.md)
 [![PowerShell](https://img.shields.io/badge/PowerShell-7.0+-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)]()
