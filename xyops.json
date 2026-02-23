@@ -1,0 +1,423 @@
+{
+  "type": "xypdf",
+  "description": "xyOps Portable Data Object",
+  "version": "1.0",
+  "xyops": "1.0.3",
+  "items": [
+    {
+      "type": "plugin",
+      "data": {
+        "id": "ad03adgroups00001",
+        "title": "AD Groups",
+        "enabled": true,
+        "type": "event",
+        "command": "pwsh",
+        "script": "#requires -Version 7.0\n# Copyright (c) 2026 xyOps. All rights reserved.\n<#!\nxyOps Active Directory Groups Event Plugin v1.0 (PowerShell 7)\nA comprehensive collection of Active Directory group management action tools (10 tools):\n\nGroup Lifecycle:  Create Group, Delete Group, Rename Group, Copy Group\nMembership:       Add Members, Remove Members, List Members\nOrganisation:     Move Group, Set Group Scope, Set Group Category\n\nSafety:\n- Destructive tools default to dry-run mode (preview changes without executing)\n- Every action emits structured audit data (who, what, when)\n- Multi-target support with per-group success/failure tracking\n\nPrerequisites:\n- ActiveDirectory PowerShell module (RSAT)\n- Domain-joined machine or connectivity to a domain controller\n- Account with Write access to target AD objects\n\nI/O contract:\n- Read one JSON object from STDIN (job), write progress/messages as JSON lines of the\n  form: { \"xy\": 1, ... } to STDOUT.\n- On success, emit: { \"xy\": 1, \"code\": 0, \"data\": <result>, \"description\": \"...\" }\n- On error, emit:   { \"xy\": 1, \"code\": <nonzero>, \"description\": \"...\" } and exit 1.\n\nTest locally:\n  pwsh -NoProfile -ExecutionPolicy Bypass -File .\\adgroups.ps1 < job.json\n#>\n\nSet-StrictMode -Version Latest\n$ErrorActionPreference = 'Stop'\n\n#region xyOps Output Helpers\n\nfunction Write-XY {\n  param([hashtable]$Object)\n  $payload = [ordered]@{ xy = 1 }\n  foreach ($k in $Object.Keys) { $payload[$k] = $Object[$k] }\n  [Console]::Out.WriteLine(($payload | ConvertTo-Json -Depth 20 -Compress))\n  [Console]::Out.Flush()\n}\n\nfunction Write-XYProgress {\n  param([double]$Value, [string]$Status)\n  $o = @{ progress = [math]::Round($Value, 4) }\n  if ($Status) { $o.status = $Status }\n  Write-XY $o\n}\n\nfunction Write-XYSuccess {\n  param($Data, [string]$Description, [array]$Files = @())\n  $o = @{ code = 0; data = $Data }\n  if ($Description) { $o.description = $Description }\n  if ($Files.Count -gt 0) { $o.files = $Files }\n  Write-XY $o\n}\n\nfunction Write-XYError {\n  param([int]$Code, [string]$Description)\n  Write-XY @{ code = $Code; description = $Description }\n}\n\nfunction Write-XYWarning {\n  param($Data, [string]$Description, [array]$Files = @())\n  $o = @{ code = 'warning'; data = $Data }\n  if ($Description) { $o.description = $Description }\n  if ($Files.Count -gt 0) { $o.files = $Files }\n  Write-XY $o\n}\n\nfunction Read-JobFromStdin {\n  $raw = [Console]::In.ReadToEnd()\n  if ([string]::IsNullOrWhiteSpace($raw)) { throw 'No job JSON received on STDIN' }\n  return $raw | ConvertFrom-Json -ErrorAction Stop\n}\n\nfunction Get-Param {\n  param($Params, [string]$Name, $Default = $null)\n  if ($Params.PSObject.Properties.Name -contains $Name) { return $Params.$Name }\n  return $Default\n}\n\n#endregion\n\n#region Module Check\n\nfunction Assert-ActiveDirectoryModule {\n  Write-XYProgress 0.05 'Checking ActiveDirectory module...'\n\n  if (-not (Get-Module -ListAvailable -Name 'ActiveDirectory')) {\n    throw @\"\nActiveDirectory PowerShell module is not installed.\n\nTo install RSAT on Windows 10/11:\n  Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0\n\nOn Windows Server:\n  Install-WindowsFeature RSAT-AD-PowerShell\n\nThe machine must be domain-joined or able to reach a domain controller.\nThe account running xyOps must have Write access to the relevant AD objects.\n\"@\n  }\n\n  Import-Module ActiveDirectory -ErrorAction Stop\n  Write-XYProgress 0.08 'ActiveDirectory module loaded'\n}\n\n#endregion\n\n#region Shared Helpers\n\nfunction Format-ADValue {\n  param($Value, [string]$PropertyName)\n\n  if ($null -eq $Value) { return '-' }\n\n  if ($Value -is [datetime]) {\n    if ($Value.Year -le 1601) { return 'Never' }\n    return $Value.ToString('yyyy-MM-dd HH:mm')\n  }\n\n  if ($Value -is [bool]) {\n    if ($Value) { return 'Yes' } else { return 'No' }\n  }\n\n  if ($Value -is [System.Security.Principal.SecurityIdentifier]) {\n    return $Value.ToString()\n  }\n\n  if ($PropertyName -in @('Manager', 'ManagedBy') -and $Value -is [string] -and $Value -match 'CN=([^,]+)') {\n    return $Matches[1]\n  }\n\n  if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {\n    $items = @($Value)\n    if ($items.Count -eq 0) { return '-' }\n    if ($items.Count -le 3) { return ($items -join ', ') }\n    return \"$($items[0..2] -join ', ') (+$($items.Count - 3) more)\"\n  }\n\n  $str = [string]$Value\n  if ([string]::IsNullOrWhiteSpace($str)) { return '-' }\n  return $str\n}\n\nfunction Get-MultipleInputs {\n  param($Value, [int]$MaxItems = 50)\n  $items = @()\n  if ($null -eq $Value) { return $items }\n  if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {\n    $items = @($Value | ForEach-Object { if ($_ -is [string]) { $_.Trim() } else { [string]$_ } } | Where-Object { $_ -ne '' })\n  } else {\n    $items = @([string]$Value -split '[,;\\n\\r]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })\n  }\n  return @($items | Select-Object -First $MaxItems)\n}\n\nfunction Get-DryRunFlag {\n  param($Params)\n  if ($Params.PSObject.Properties.Name -contains 'dryRun') { return [bool]$Params.dryRun }\n  return $true  # Default: dry-run enabled (safe)\n}\n\nfunction Get-DryRunLabel {\n  param([bool]$IsDryRun)\n  if ($IsDryRun) { return '[DRY-RUN] ' } else { return '' }\n}\n\nfunction Resolve-ADGroups {\n  param([array]$Identities, [double]$ProgressStart = 0.15, [double]$ProgressEnd = 0.35)\n\n  $resolved = [System.Collections.Generic.List[object]]::new()\n  $idx = 0\n  foreach ($identity in $Identities) {\n    $idx++\n    $pct = $ProgressStart + (($ProgressEnd - $ProgressStart) * $idx / $Identities.Count)\n    Write-XYProgress $pct \"Resolving group '$identity'...\"\n    try {\n      $group = Get-ADGroup -Identity $identity -Properties Name, SamAccountName, GroupScope,\n        GroupCategory, Description, ManagedBy, Members, MemberOf,\n        DistinguishedName, Created, Modified -ErrorAction Stop\n      $resolved.Add([PSCustomObject]@{\n        Group    = $group\n        Identity = $identity\n        Success  = $true\n        Error    = $null\n      })\n    } catch {\n      # Fallback: search by Name\n      $escaped = $identity -replace \"'\", \"''\"\n      $fbGroup = Get-ADGroup -Filter \"Name -eq '$escaped'\" -Properties Name, SamAccountName, GroupScope,\n        GroupCategory, Description, ManagedBy, Members, MemberOf,\n        DistinguishedName, Created, Modified -ErrorAction SilentlyContinue | Select-Object -First 1\n      if ($fbGroup) {\n        $resolved.Add([PSCustomObject]@{\n          Group    = $fbGroup\n          Identity = $identity\n          Success  = $true\n          Error    = $null\n        })\n      } else {\n        $resolved.Add([PSCustomObject]@{\n          Group    = $null\n          Identity = $identity\n          Success  = $false\n          Error    = \"Cannot find group '$identity'\"\n        })\n      }\n    }\n  }\n  return $resolved\n}\n\nfunction Resolve-SingleGroup {\n  param([string]$Identity, [string[]]$Properties = @())\n  try {\n    $p = @{ Identity = $Identity; ErrorAction = 'Stop' }\n    if ($Properties.Count -gt 0) { $p.Properties = $Properties }\n    return Get-ADGroup @p\n  } catch {\n    $escaped = $Identity -replace \"'\", \"''\"\n    $p = @{ Filter = \"Name -eq '$escaped'\"; ErrorAction = 'Stop' }\n    if ($Properties.Count -gt 0) { $p.Properties = $Properties }\n    $results = @(Get-ADGroup @p)\n    if ($results.Count -eq 1) { return $results[0] }\n    if ($results.Count -gt 1) { throw \"Multiple groups match name '$Identity'. Use SamAccountName or DN.\" }\n    throw \"Cannot find group '$Identity'\"\n  }\n}\n\n#endregion\n\n#region Group Lifecycle Tools\n\nfunction Invoke-CreateGroup {\n  param($Params)\n\n  Write-XYProgress 0.10 'Preparing to create group...'\n\n  $groupName     = (Get-Param $Params 'groupName' '').Trim()\n  $samAccount    = (Get-Param $Params 'samAccountName' '').Trim()\n  $displayName   = (Get-Param $Params 'displayName' '').Trim()\n  $description   = (Get-Param $Params 'description' '').Trim()\n  $targetOU      = (Get-Param $Params 'targetOU' '').Trim()\n  $groupScope    = (Get-Param $Params 'groupScope' 'Global').Trim()\n  $groupCategory = (Get-Param $Params 'groupCategory' 'Security').Trim()\n  $managedBy     = (Get-Param $Params 'managedBy' '').Trim()\n\n  if (-not $groupName) { throw 'Group name is required.' }\n  if (-not $samAccount) { $samAccount = $groupName -replace '[^a-zA-Z0-9._-]', '' }\n  if (-not $displayName) { $displayName = $groupName }\n\n  # Validate scope\n  if ($groupScope -notin @('Global', 'Universal', 'DomainLocal')) {\n    throw \"Invalid group scope '$groupScope'. Use Global, Universal, or DomainLocal.\"\n  }\n\n  Write-XYProgress 0.30 'Creating group...'\n\n  $newGroupParams = @{\n    Name           = $groupName\n    SamAccountName = $samAccount\n    DisplayName    = $displayName\n    GroupScope     = $groupScope\n    GroupCategory  = $groupCategory\n  }\n  if ($description) { $newGroupParams.Description = $description }\n  if ($targetOU) { $newGroupParams.Path = $targetOU }\n\n  New-ADGroup @newGroupParams -ErrorAction Stop\n  Write-XYProgress 0.55 'Group created'\n\n  if ($managedBy) {\n    try { Set-ADGroup -Identity $samAccount -ManagedBy $managedBy -ErrorAction Stop } catch {}\n  }\n\n  Write-XYProgress 0.80 'Building output...'\n\n  $createdGroup = Get-ADGroup -Identity $samAccount -Properties * -ErrorAction Stop\n\n  $rows = @(\n    @('Name', $createdGroup.Name),\n    @('SAM Account', $createdGroup.SamAccountName),\n    @('Display Name', $createdGroup.DisplayName),\n    @('Scope', [string]$createdGroup.GroupScope),\n    @('Category', [string]$createdGroup.GroupCategory),\n    @('Description', $(if ($createdGroup.Description) { $createdGroup.Description } else { '-' })),\n    @('OU', $createdGroup.DistinguishedName -replace \"^CN=[^,]+,\", \"\"),\n    @('Managed By', $(Format-ADValue -Value $createdGroup.ManagedBy -PropertyName 'ManagedBy'))\n  )\n\n  Write-XY @{ table = @{\n    title   = \"Group Created — $($createdGroup.Name)\"\n    header  = @('Property', 'Value')\n    rows    = $rows\n    caption = \"Group '$samAccount' created successfully\"\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Create Group'; success = $true\n    samAccountName = $samAccount; name = $groupName\n    scope = $groupScope; category = $groupCategory\n    dn = $createdGroup.DistinguishedName\n    generatedFiles = @()\n  }\n}\n\nfunction Invoke-DeleteGroup {\n  param($Params)\n\n  $dryRun = Get-DryRunFlag $Params\n  $label = Get-DryRunLabel $dryRun\n  $targetGroupsInput = Get-Param $Params 'targetGroups' ''\n  $targets = @(Get-MultipleInputs $targetGroupsInput 50)\n  if ($targets.Count -eq 0) { throw 'No target group(s) specified.' }\n\n  Write-XYProgress 0.10 \"${label}Resolving groups...\"\n  $resolved = Resolve-ADGroups -Identities $targets\n\n  Write-XYProgress 0.40 \"${label}Processing deletions...\"\n\n  $displayHeaders = @('#', 'Name', 'SAM Account', 'Status', 'Detail')\n  $tableRows = @()\n  $successCount = 0; $failCount = 0\n  $idx = 0\n\n  foreach ($r in $resolved) {\n    $idx++\n    $pct = 0.40 + (0.45 * $idx / $resolved.Count)\n    if (-not $r.Success) {\n      $failCount++\n      $tableRows += ,@($idx, '-', $r.Identity, 'FAILED', \"Not found: $($r.Error)\")\n      continue\n    }\n\n    $group = $r.Group\n    Write-XYProgress $pct \"${label}Processing '$($group.SamAccountName)'...\"\n\n    if ($dryRun) {\n      $memberCount = if ($group.Members) { @($group.Members).Count } else { 0 }\n      $successCount++\n      $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'WOULD DELETE',\n        \"Scope: $($group.GroupScope) | Category: $($group.GroupCategory) | Members: $memberCount\")\n    } else {\n      try {\n        Remove-ADGroup -Identity $group.DistinguishedName -Confirm:$false -ErrorAction Stop\n        $successCount++\n        $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'DELETED', 'Group removed from AD')\n      } catch {\n        $failCount++\n        $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'FAILED', $_.Exception.Message)\n      }\n    }\n  }\n\n  $modeText = if ($dryRun) { 'DRY-RUN — no changes made' } else { \"$successCount deleted, $failCount failed\" }\n  Write-XY @{ table = @{\n    title   = \"${label}Delete Group\"\n    header  = $displayHeaders\n    rows    = $tableRows\n    caption = $modeText\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Delete Group'; success = ($failCount -eq 0); dryRun = $dryRun\n    totalTargets = $targets.Count; successCount = $successCount; failCount = $failCount\n    generatedFiles = @()\n  }\n}\n\nfunction Invoke-RenameGroup {\n  param($Params)\n\n  $dryRun = Get-DryRunFlag $Params\n  $label = Get-DryRunLabel $dryRun\n  $targetGroup    = (Get-Param $Params 'targetGroup' '').Trim()\n  $newName        = (Get-Param $Params 'newName' '').Trim()\n  $newSamAccount  = (Get-Param $Params 'newSamAccountName' '').Trim()\n  $newDisplayName = (Get-Param $Params 'newDisplayName' '').Trim()\n  $newDescription = (Get-Param $Params 'description' '').Trim()\n  $newManagedBy   = (Get-Param $Params 'managedBy' '').Trim()\n\n  if (-not $targetGroup) { throw 'Target group is required.' }\n  if (-not $newName -and -not $newSamAccount -and -not $newDisplayName -and -not $newDescription -and -not $newManagedBy) {\n    throw 'At least one new value must be provided.'\n  }\n\n  Write-XYProgress 0.15 \"${label}Loading group...\"\n  $group = Resolve-SingleGroup -Identity $targetGroup -Properties @('DisplayName', 'SamAccountName', 'Description', 'ManagedBy')\n\n  Write-XYProgress 0.35 \"${label}Preparing rename...\"\n\n  $changes = @()\n  if ($newSamAccount -and $newSamAccount -ne $group.SamAccountName) {\n    $changes += ,@('SamAccountName', $group.SamAccountName, $newSamAccount)\n  }\n  if ($newDisplayName -and $newDisplayName -ne $group.DisplayName) {\n    $changes += ,@('DisplayName', $(if ($group.DisplayName) { $group.DisplayName } else { '-' }), $newDisplayName)\n  }\n  if ($newName -and $newName -ne $group.Name) {\n    $changes += ,@('CN (Name)', $group.Name, $newName)\n  }\n  if ($newDescription -and $newDescription -ne $group.Description) {\n    $changes += ,@('Description', $(if ($group.Description) { $group.Description } else { '-' }), $newDescription)\n  }\n  if ($newManagedBy) {\n    $oldManaged = Format-ADValue -Value $group.ManagedBy -PropertyName 'ManagedBy'\n    $changes += ,@('Managed By', $oldManaged, $newManagedBy)\n  }\n\n  if ($changes.Count -eq 0) {\n    throw 'No changes detected — all new values match current values.'\n  }\n\n  $displayHeaders = @('Property', 'Current', 'New')\n  $tableRows = @()\n  foreach ($c in $changes) {\n    $tableRows += ,@($c[0], $c[1], $c[2])\n  }\n\n  if (-not $dryRun) {\n    Write-XYProgress 0.55 'Applying changes...'\n\n    $setParams = @{}\n    if ($newSamAccount -and $newSamAccount -ne $group.SamAccountName) { $setParams.SamAccountName = $newSamAccount }\n    if ($newDisplayName -and $newDisplayName -ne $group.DisplayName) { $setParams.DisplayName = $newDisplayName }\n    if ($newDescription -and $newDescription -ne $group.Description) { $setParams.Description = $newDescription }\n    if ($newManagedBy) { $setParams.ManagedBy = $newManagedBy }\n\n    if ($setParams.Count -gt 0) {\n      Set-ADGroup -Identity $group.DistinguishedName @setParams -ErrorAction Stop\n    }\n\n    if ($newName -and $newName -ne $group.Name) {\n      Rename-ADObject -Identity $group.DistinguishedName -NewName $newName -ErrorAction Stop\n    }\n  }\n\n  $modeText = if ($dryRun) { 'DRY-RUN — no changes made' } else { \"$($tableRows.Count) attribute(s) updated\" }\n  Write-XY @{ table = @{\n    title   = \"${label}Rename Group — $($group.Name)\"\n    header  = $displayHeaders\n    rows    = $tableRows\n    caption = $modeText\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Rename Group'; success = $true; dryRun = $dryRun\n    targetGroup = $group.SamAccountName; changesCount = $tableRows.Count\n    generatedFiles = @()\n  }\n}\n\nfunction Invoke-CopyGroup {\n  param($Params)\n\n  Write-XYProgress 0.10 'Preparing to copy group...'\n\n  $sourceGroup   = (Get-Param $Params 'sourceGroup' '').Trim()\n  $newGroupName  = (Get-Param $Params 'newGroupName' '').Trim()\n  $newSamAccount = (Get-Param $Params 'newSamAccountName' '').Trim()\n  $targetOU      = (Get-Param $Params 'targetOU' '').Trim()\n  $description   = (Get-Param $Params 'description' '').Trim()\n  $managedBy     = (Get-Param $Params 'managedBy' '').Trim()\n  $copyMembers   = if ($Params.PSObject.Properties.Name -contains 'copyMembers') { [bool]$Params.copyMembers } else { $true }\n\n  if (-not $sourceGroup) { throw 'Source group is required.' }\n  if (-not $newGroupName) { throw 'New group name is required.' }\n  if (-not $newSamAccount) { $newSamAccount = $newGroupName -replace '[^a-zA-Z0-9._-]', '' }\n\n  Write-XYProgress 0.20 \"Loading source group '$sourceGroup'...\"\n  $template = Resolve-SingleGroup -Identity $sourceGroup -Properties @('Description', 'ManagedBy', 'Members', 'GroupScope', 'GroupCategory', 'DisplayName', 'DistinguishedName')\n\n  Write-XYProgress 0.35 'Creating new group from template...'\n\n  $ou = if ($targetOU) { $targetOU } else { $template.DistinguishedName -replace '^CN=[^,]+,' }\n\n  $newGroupParams = @{\n    Name           = $newGroupName\n    SamAccountName = $newSamAccount\n    DisplayName    = $newGroupName\n    GroupScope     = $template.GroupScope\n    GroupCategory  = $template.GroupCategory\n    Path           = $ou\n  }\n  $finalDesc = if ($description) { $description } elseif ($template.Description) { $template.Description } else { $null }\n  if ($finalDesc) { $newGroupParams.Description = $finalDesc }\n\n  New-ADGroup @newGroupParams -ErrorAction Stop\n  Write-XYProgress 0.50 'Group created, copying settings...'\n\n  $finalManagedBy = if ($managedBy) { $managedBy } elseif ($template.ManagedBy) { $template.ManagedBy } else { $null }\n  if ($finalManagedBy) {\n    try { Set-ADGroup -Identity $newSamAccount -ManagedBy $finalManagedBy -ErrorAction Stop } catch {}\n  }\n\n  # Copy members\n  $membersCopied = 0\n  if ($copyMembers -and $template.Members) {\n    Write-XYProgress 0.60 'Copying members...'\n    $members = @($template.Members)\n    foreach ($memberDN in $members) {\n      try {\n        Add-ADGroupMember -Identity $newSamAccount -Members $memberDN -ErrorAction Stop\n        $membersCopied++\n      } catch {}\n    }\n  }\n\n  Write-XYProgress 0.85 'Building output...'\n\n  $totalMembers = if ($template.Members) { @($template.Members).Count } else { 0 }\n  $rows = @(\n    @('Source Group', \"$($template.Name) ($($template.SamAccountName))\"),\n    @('New Group', \"$newGroupName ($newSamAccount)\"),\n    @('Scope', [string]$template.GroupScope),\n    @('Category', [string]$template.GroupCategory),\n    @('OU', $ou),\n    @('Members Copied', \"$membersCopied of $totalMembers\"),\n    @('Managed By', $(Format-ADValue -Value $template.ManagedBy -PropertyName 'ManagedBy'))\n  )\n\n  Write-XY @{ table = @{\n    title   = \"Group Copied — $newGroupName\"\n    header  = @('Property', 'Value')\n    rows    = $rows\n    caption = \"Group '$newSamAccount' created from template '$($template.SamAccountName)'\"\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Copy Group'; success = $true\n    sourceGroup = $template.SamAccountName; newGroup = $newSamAccount\n    membersCopied = $membersCopied; totalMembers = $totalMembers\n    generatedFiles = @()\n  }\n}\n\n#endregion\n\n#region Membership Tools\n\nfunction Invoke-AddMembers {\n  param($Params)\n\n  $targetGroupsInput = Get-Param $Params 'targetGroups' ''\n  $membersInput      = Get-Param $Params 'members' ''\n  $groups  = @(Get-MultipleInputs $targetGroupsInput 50)\n  $members = @(Get-MultipleInputs $membersInput 50)\n\n  if ($groups.Count -eq 0) { throw 'No target group(s) specified.' }\n  if ($members.Count -eq 0) { throw 'No member(s) specified.' }\n\n  # Pre-validate: resolve all target groups before processing\n  Write-XYProgress 0.05 \"Validating $($groups.Count) target group(s)...\"\n  $resolvedGroups = Resolve-ADGroups -Identities $groups -ProgressStart 0.05 -ProgressEnd 0.15\n  $failedGroups = @($resolvedGroups | Where-Object { -not $_.Success })\n  if ($failedGroups.Count -gt 0) {\n    $names = ($failedGroups | ForEach-Object { \"'$($_.Identity)'\" }) -join ', '\n    throw \"Target group(s) not found: $names\"\n  }\n\n  Write-XYProgress 0.15 \"Adding $($members.Count) member(s) to $($groups.Count) group(s)...\"\n\n  $displayHeaders = @('#', 'Member', 'Group', 'Status', 'Detail')\n  $tableRows = @()\n  $successCount = 0; $failCount = 0; $skippedCount = 0\n  $idx = 0\n\n  foreach ($memberIdentity in $members) {\n    foreach ($rg in $resolvedGroups) {\n      $idx++\n      $groupObj = $rg.Group\n      $pct = 0.15 + (0.75 * $idx / ($members.Count * $resolvedGroups.Count))\n      Write-XYProgress $pct \"Adding '$memberIdentity' to '$($groupObj.Name)'...\"\n\n      try {\n        # Try user first, then computer, then group\n        $memberObj = $null\n        try { $memberObj = Get-ADUser -Identity $memberIdentity -ErrorAction Stop } catch {}\n        if (-not $memberObj) { try { $memberObj = Get-ADComputer -Identity $memberIdentity -ErrorAction Stop } catch {} }\n        if (-not $memberObj) { try { $memberObj = Get-ADGroup -Identity $memberIdentity -ErrorAction Stop } catch {} }\n        if (-not $memberObj) { throw \"Could not find AD object '$memberIdentity'\" }\n\n        $isMember = $groupObj.Members -contains $memberObj.DistinguishedName\n\n        if ($isMember) {\n          $skippedCount++\n          $tableRows += ,@($idx, $memberObj.Name, $groupObj.Name, 'SKIPPED', 'Already a member')\n        } else {\n          Add-ADGroupMember -Identity $groupObj -Members $memberObj -ErrorAction Stop\n          $successCount++\n          $tableRows += ,@($idx, $memberObj.Name, $groupObj.Name, 'ADDED', 'Successfully added')\n        }\n      } catch {\n        $failCount++\n        $tableRows += ,@($idx, $memberIdentity, $groupObj.Name, 'FAILED', $_.Exception.Message)\n      }\n    }\n  }\n\n  Write-XY @{ table = @{\n    title   = 'Add Members'\n    header  = $displayHeaders\n    rows    = $tableRows\n    caption = \"$successCount added, $skippedCount already members, $failCount failed\"\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Add Members'; success = ($failCount -eq 0)\n    warning = ($failCount -gt 0)\n    totalOperations = $idx; successCount = $successCount\n    skippedCount = $skippedCount; failCount = $failCount\n    generatedFiles = @()\n  }\n}\n\nfunction Invoke-RemoveMembers {\n  param($Params)\n\n  $dryRun = Get-DryRunFlag $Params\n  $label = Get-DryRunLabel $dryRun\n  $targetGroupsInput = Get-Param $Params 'targetGroups' ''\n  $membersInput      = Get-Param $Params 'members' ''\n  $groups  = @(Get-MultipleInputs $targetGroupsInput 50)\n  $members = @(Get-MultipleInputs $membersInput 50)\n\n  if ($groups.Count -eq 0) { throw 'No target group(s) specified.' }\n  if ($members.Count -eq 0) { throw 'No member(s) specified.' }\n\n  # Pre-validate: resolve all target groups before processing\n  Write-XYProgress 0.05 \"${label}Validating $($groups.Count) target group(s)...\"\n  $resolvedGroups = Resolve-ADGroups -Identities $groups -ProgressStart 0.05 -ProgressEnd 0.15\n  $failedGroups = @($resolvedGroups | Where-Object { -not $_.Success })\n  if ($failedGroups.Count -gt 0) {\n    $names = ($failedGroups | ForEach-Object { \"'$($_.Identity)'\" }) -join ', '\n    throw \"Target group(s) not found: $names\"\n  }\n\n  Write-XYProgress 0.15 \"${label}Removing $($members.Count) member(s) from $($groups.Count) group(s)...\"\n\n  $displayHeaders = @('#', 'Member', 'Group', 'Status', 'Detail')\n  $tableRows = @()\n  $successCount = 0; $failCount = 0; $skippedCount = 0\n  $idx = 0\n\n  foreach ($memberIdentity in $members) {\n    foreach ($rg in $resolvedGroups) {\n      $idx++\n      $groupObj = $rg.Group\n      $pct = 0.15 + (0.75 * $idx / ($members.Count * $resolvedGroups.Count))\n      Write-XYProgress $pct \"${label}Processing '$memberIdentity' from '$($groupObj.Name)'...\"\n\n      try {\n        $memberObj = $null\n        try { $memberObj = Get-ADUser -Identity $memberIdentity -ErrorAction Stop } catch {}\n        if (-not $memberObj) { try { $memberObj = Get-ADComputer -Identity $memberIdentity -ErrorAction Stop } catch {} }\n        if (-not $memberObj) { try { $memberObj = Get-ADGroup -Identity $memberIdentity -ErrorAction Stop } catch {} }\n        if (-not $memberObj) { throw \"Could not find AD object '$memberIdentity'\" }\n\n        $isMember = $groupObj.Members -contains $memberObj.DistinguishedName\n\n        if (-not $isMember) {\n          $skippedCount++\n          $tableRows += ,@($idx, $memberObj.Name, $groupObj.Name, 'SKIPPED', 'Not a member')\n        } elseif ($dryRun) {\n          $successCount++\n          $tableRows += ,@($idx, $memberObj.Name, $groupObj.Name, 'WOULD REMOVE', 'Currently a member')\n        } else {\n          Remove-ADGroupMember -Identity $groupObj -Members $memberObj -Confirm:$false -ErrorAction Stop\n          $successCount++\n          $tableRows += ,@($idx, $memberObj.Name, $groupObj.Name, 'REMOVED', 'Successfully removed')\n        }\n      } catch {\n        $failCount++\n        $tableRows += ,@($idx, $memberIdentity, $groupObj.Name, 'FAILED', $_.Exception.Message)\n      }\n    }\n  }\n\n  $modeText = if ($dryRun) { 'DRY-RUN — no changes made' } else { \"$successCount removed, $skippedCount not members, $failCount failed\" }\n  Write-XY @{ table = @{\n    title   = \"${label}Remove Members\"\n    header  = $displayHeaders\n    rows    = $tableRows\n    caption = $modeText\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Remove Members'; success = ($failCount -eq 0); dryRun = $dryRun\n    warning = ($failCount -gt 0 -and -not $dryRun)\n    totalOperations = $idx; successCount = $successCount\n    skippedCount = $skippedCount; failCount = $failCount\n    generatedFiles = @()\n  }\n}\n\nfunction Invoke-ListMembers {\n  param($Params)\n\n  $targetGroup = (Get-Param $Params 'targetGroup' '').Trim()\n  $recursive   = if ($Params.PSObject.Properties.Name -contains 'recursive') { [bool]$Params.recursive } else { $false }\n\n  if (-not $targetGroup) { throw 'Target group is required.' }\n\n  Write-XYProgress 0.15 \"Loading group '$targetGroup'...\"\n  $group = Resolve-SingleGroup -Identity $targetGroup -Properties @('Description', 'ManagedBy', 'GroupScope', 'GroupCategory')\n\n  Write-XYProgress 0.30 'Retrieving members...'\n\n  $getMemberParams = @{ Identity = $group.DistinguishedName }\n  if ($recursive) { $getMemberParams.Recursive = $true }\n\n  $memberObjects = @(Get-ADGroupMember @getMemberParams -ErrorAction Stop)\n\n  Write-XYProgress 0.60 \"Processing $($memberObjects.Count) member(s)...\"\n\n  $displayHeaders = @('#', 'Name', 'SAM Account', 'Type', 'Enabled')\n  $tableRows = @()\n  $idx = 0\n\n  foreach ($member in $memberObjects) {\n    $idx++\n    $enabled = '-'\n    if ($member.objectClass -eq 'user') {\n      try {\n        $u = Get-ADUser -Identity $member.DistinguishedName -Properties Enabled -ErrorAction Stop\n        $enabled = Format-ADValue -Value $u.Enabled -PropertyName 'Enabled'\n      } catch { $enabled = '?' }\n    } elseif ($member.objectClass -eq 'computer') {\n      try {\n        $c = Get-ADComputer -Identity $member.DistinguishedName -Properties Enabled -ErrorAction Stop\n        $enabled = Format-ADValue -Value $c.Enabled -PropertyName 'Enabled'\n      } catch { $enabled = '?' }\n    }\n\n    $typeLabel = switch ($member.objectClass) {\n      'user'     { 'User' }\n      'computer' { 'Computer' }\n      'group'    { 'Group' }\n      default    { $member.objectClass }\n    }\n\n    $tableRows += ,@($idx, $member.Name, $member.SamAccountName, $typeLabel, $enabled)\n  }\n\n  $recursiveText = if ($recursive) { ' (recursive)' } else { '' }\n  Write-XY @{ table = @{\n    title   = \"Members of $($group.Name)$recursiveText\"\n    header  = $displayHeaders\n    rows    = $tableRows\n    caption = \"$($memberObjects.Count) member(s) | Scope: $($group.GroupScope) | Category: $($group.GroupCategory)\"\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'List Members'; success = $true\n    targetGroup = $group.SamAccountName; memberCount = $memberObjects.Count\n    recursive = $recursive\n    generatedFiles = @()\n  }\n}\n\n#endregion\n\n#region Organisation Tools\n\nfunction Invoke-MoveGroup {\n  param($Params)\n\n  $dryRun = Get-DryRunFlag $Params\n  $label = Get-DryRunLabel $dryRun\n  $targetGroupsInput = Get-Param $Params 'targetGroups' ''\n  $targets = @(Get-MultipleInputs $targetGroupsInput 50)\n  $targetOU = (Get-Param $Params 'targetOU' '').Trim()\n\n  if ($targets.Count -eq 0) { throw 'No target group(s) specified.' }\n  if (-not $targetOU) { throw 'Target OU is required. Provide a Distinguished Name (e.g., OU=Groups,DC=contoso,DC=com).' }\n\n  Write-XYProgress 0.10 \"${label}Resolving $($targets.Count) group(s)...\"\n  $resolved = Resolve-ADGroups -Identities $targets\n\n  Write-XYProgress 0.40 \"${label}Moving groups...\"\n\n  $displayHeaders = @('#', 'Name', 'SAM Account', 'Status', 'From OU', 'To OU')\n  $tableRows = @()\n  $successCount = 0; $failCount = 0\n  $idx = 0\n\n  foreach ($r in $resolved) {\n    $idx++\n    if (-not $r.Success) {\n      $failCount++\n      $tableRows += ,@($idx, '-', $r.Identity, 'FAILED', '-', \"Not found: $($r.Error)\")\n      continue\n    }\n\n    $group = $r.Group\n    $currentOU = $group.DistinguishedName -replace '^CN=[^,]+,'\n\n    if ($dryRun) {\n      $successCount++\n      $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'WOULD MOVE', $currentOU, $targetOU)\n    } else {\n      try {\n        Move-ADObject -Identity $group.DistinguishedName -TargetPath $targetOU -ErrorAction Stop\n        $successCount++\n        $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'MOVED', $currentOU, $targetOU)\n      } catch {\n        $failCount++\n        $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'FAILED', $currentOU, $_.Exception.Message)\n      }\n    }\n  }\n\n  $modeText = if ($dryRun) { 'DRY-RUN — no changes made' } else { \"$successCount moved, $failCount failed\" }\n  Write-XY @{ table = @{\n    title   = \"${label}Move Group\"\n    header  = $displayHeaders\n    rows    = $tableRows\n    caption = $modeText\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Move Group'; success = ($failCount -eq 0); dryRun = $dryRun\n    totalTargets = $targets.Count; successCount = $successCount; failCount = $failCount\n    generatedFiles = @()\n  }\n}\n\nfunction Invoke-SetGroupScope {\n  param($Params)\n\n  $dryRun = Get-DryRunFlag $Params\n  $label = Get-DryRunLabel $dryRun\n  $targetGroupsInput = Get-Param $Params 'targetGroups' ''\n  $targets = @(Get-MultipleInputs $targetGroupsInput 50)\n  $newScope = (Get-Param $Params 'newScope' '').Trim()\n\n  if ($targets.Count -eq 0) { throw 'No target group(s) specified.' }\n  if (-not $newScope) { throw 'New scope is required (Global, Universal, or DomainLocal).' }\n  if ($newScope -notin @('Global', 'Universal', 'DomainLocal')) {\n    throw \"Invalid scope '$newScope'. Use Global, Universal, or DomainLocal.\"\n  }\n\n  Write-XYProgress 0.10 \"${label}Resolving $($targets.Count) group(s)...\"\n  $resolved = Resolve-ADGroups -Identities $targets\n\n  Write-XYProgress 0.40 \"${label}Changing scope...\"\n\n  $displayHeaders = @('#', 'Name', 'SAM Account', 'Status', 'Previous Scope', 'New Scope')\n  $tableRows = @()\n  $successCount = 0; $failCount = 0; $skippedCount = 0\n  $idx = 0\n\n  foreach ($r in $resolved) {\n    $idx++\n    if (-not $r.Success) {\n      $failCount++\n      $tableRows += ,@($idx, '-', $r.Identity, 'FAILED', '-', \"Not found: $($r.Error)\")\n      continue\n    }\n\n    $group = $r.Group\n    $currentScope = [string]$group.GroupScope\n\n    if ($currentScope -eq $newScope) {\n      $skippedCount++\n      $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'SKIPPED', $currentScope, \"Already $newScope\")\n      continue\n    }\n\n    if ($dryRun) {\n      $successCount++\n      $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'WOULD CHANGE', $currentScope, $newScope)\n    } else {\n      try {\n        Set-ADGroup -Identity $group.DistinguishedName -GroupScope $newScope -ErrorAction Stop\n        $successCount++\n        $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'CHANGED', $currentScope, $newScope)\n      } catch {\n        $failCount++\n        $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'FAILED', $currentScope, $_.Exception.Message)\n      }\n    }\n  }\n\n  $modeText = if ($dryRun) { 'DRY-RUN — no changes made' } else { \"$successCount changed, $skippedCount already $newScope, $failCount failed\" }\n  Write-XY @{ table = @{\n    title   = \"${label}Set Group Scope\"\n    header  = $displayHeaders\n    rows    = $tableRows\n    caption = $modeText\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Set Group Scope'; success = ($failCount -eq 0); dryRun = $dryRun\n    totalTargets = $targets.Count; successCount = $successCount\n    skippedCount = $skippedCount; failCount = $failCount\n    generatedFiles = @()\n  }\n}\n\nfunction Invoke-SetGroupCategory {\n  param($Params)\n\n  $dryRun = Get-DryRunFlag $Params\n  $label = Get-DryRunLabel $dryRun\n  $targetGroupsInput = Get-Param $Params 'targetGroups' ''\n  $targets = @(Get-MultipleInputs $targetGroupsInput 50)\n  $newCategory = (Get-Param $Params 'newCategory' '').Trim()\n\n  if ($targets.Count -eq 0) { throw 'No target group(s) specified.' }\n  if (-not $newCategory) { throw 'New category is required (Security or Distribution).' }\n  if ($newCategory -notin @('Security', 'Distribution')) {\n    throw \"Invalid category '$newCategory'. Use Security or Distribution.\"\n  }\n\n  Write-XYProgress 0.10 \"${label}Resolving $($targets.Count) group(s)...\"\n  $resolved = Resolve-ADGroups -Identities $targets\n\n  Write-XYProgress 0.40 \"${label}Changing category...\"\n\n  $displayHeaders = @('#', 'Name', 'SAM Account', 'Status', 'Previous', 'New')\n  $tableRows = @()\n  $successCount = 0; $failCount = 0; $skippedCount = 0\n  $idx = 0\n\n  foreach ($r in $resolved) {\n    $idx++\n    if (-not $r.Success) {\n      $failCount++\n      $tableRows += ,@($idx, '-', $r.Identity, 'FAILED', '-', \"Not found: $($r.Error)\")\n      continue\n    }\n\n    $group = $r.Group\n    $currentCategory = [string]$group.GroupCategory\n\n    if ($currentCategory -eq $newCategory) {\n      $skippedCount++\n      $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'SKIPPED', $currentCategory, \"Already $newCategory\")\n      continue\n    }\n\n    if ($dryRun) {\n      $successCount++\n      $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'WOULD CHANGE', $currentCategory, $newCategory)\n    } else {\n      try {\n        Set-ADGroup -Identity $group.DistinguishedName -GroupCategory $newCategory -ErrorAction Stop\n        $successCount++\n        $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'CHANGED', $currentCategory, $newCategory)\n      } catch {\n        $failCount++\n        $tableRows += ,@($idx, $group.Name, $group.SamAccountName, 'FAILED', $currentCategory, $_.Exception.Message)\n      }\n    }\n  }\n\n  $modeText = if ($dryRun) { 'DRY-RUN — no changes made' } else { \"$successCount changed, $skippedCount unchanged, $failCount failed\" }\n  Write-XY @{ table = @{\n    title   = \"${label}Set Group Category\"\n    header  = $displayHeaders\n    rows    = $tableRows\n    caption = $modeText\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Set Group Category'; success = ($failCount -eq 0); dryRun = $dryRun\n    totalTargets = $targets.Count; successCount = $successCount\n    skippedCount = $skippedCount; failCount = $failCount\n    generatedFiles = @()\n  }\n}\n\nfunction Invoke-SetGroupDescription {\n  param($Params)\n\n  $targetGroupsInput = Get-Param $Params 'targetGroups' ''\n  $targets = @(Get-MultipleInputs $targetGroupsInput 50)\n  $newDescription = (Get-Param $Params 'description' '').Trim()\n  $managedBy      = (Get-Param $Params 'managedBy' '').Trim()\n  $clearManagedBy = if ($Params.PSObject.Properties.Name -contains 'clearManagedBy') { [bool]$Params.clearManagedBy } else { $false }\n\n  if ($targets.Count -eq 0) { throw 'No target group(s) specified.' }\n  if (-not $newDescription -and -not $managedBy -and -not $clearManagedBy) {\n    throw 'At least one change must be specified (description, managedBy, or clearManagedBy).'\n  }\n\n  Write-XYProgress 0.10 \"Resolving $($targets.Count) group(s)...\"\n  $resolved = Resolve-ADGroups -Identities $targets\n\n  Write-XYProgress 0.40 'Updating groups...'\n\n  $displayHeaders = @('#', 'Name', 'Status', 'Changes')\n  $tableRows = @()\n  $successCount = 0; $failCount = 0\n  $idx = 0\n\n  foreach ($r in $resolved) {\n    $idx++\n    if (-not $r.Success) {\n      $failCount++\n      $tableRows += ,@($idx, $r.Identity, 'FAILED', \"Not found: $($r.Error)\")\n      continue\n    }\n\n    $group = $r.Group\n    $changes = @()\n\n    try {\n      $setParams = @{}\n      $clearAttrs = @()\n\n      if ($newDescription) {\n        $setParams.Description = $newDescription\n        $changes += \"Description='$newDescription'\"\n      }\n      if ($managedBy) {\n        $setParams.ManagedBy = $managedBy\n        $changes += \"ManagedBy='$managedBy'\"\n      }\n      if ($clearManagedBy -and $group.ManagedBy) {\n        $clearAttrs += 'ManagedBy'\n        $changes += 'ManagedBy=cleared'\n      }\n\n      if ($setParams.Count -gt 0) {\n        Set-ADGroup -Identity $group.DistinguishedName @setParams -ErrorAction Stop\n      }\n      if ($clearAttrs.Count -gt 0) {\n        Set-ADGroup -Identity $group.DistinguishedName -Clear $clearAttrs -ErrorAction Stop\n      }\n\n      $successCount++\n      $tableRows += ,@($idx, $group.Name, 'UPDATED', ($changes -join ' | '))\n    } catch {\n      $failCount++\n      $tableRows += ,@($idx, $group.Name, 'FAILED', $_.Exception.Message)\n    }\n  }\n\n  Write-XY @{ table = @{\n    title   = 'Set Group Description'\n    header  = $displayHeaders\n    rows    = $tableRows\n    caption = \"$successCount updated, $failCount failed\"\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Set Group Description'; success = ($failCount -eq 0)\n    totalTargets = $targets.Count; successCount = $successCount; failCount = $failCount\n    generatedFiles = @()\n  }\n}\n\n#endregion\n\n#region Main Entry Point\n\ntry {\n  $job = Read-JobFromStdin\n  $Params = $job.params\n  $tool = if ($Params.PSObject.Properties.Name -contains 'tool') { $Params.tool } else { 'createGroup' }\n  $Cwd = if ($job.PSObject.Properties.Name -contains 'cwd') { $job.cwd } else { $null }\n  if ($Cwd -and (Test-Path $Cwd -PathType Container)) { Set-Location $Cwd }\n\n  Write-XYProgress 0.02 'Starting AD Groups...'\n\n  # Check AD module\n  Assert-ActiveDirectoryModule\n\n  $result = $null\n  switch ($tool) {\n    # Group Lifecycle\n    'createGroup'       { $result = Invoke-CreateGroup -Params $Params }\n    'deleteGroup'       { $result = Invoke-DeleteGroup -Params $Params }\n    'renameGroup'       { $result = Invoke-RenameGroup -Params $Params }\n    'copyGroup'         { $result = Invoke-CopyGroup -Params $Params }\n\n    # Membership\n    'addMembers'        { $result = Invoke-AddMembers -Params $Params }\n    'removeMembers'     { $result = Invoke-RemoveMembers -Params $Params }\n    'listMembers'       { $result = Invoke-ListMembers -Params $Params }\n\n    # Organisation\n    'moveGroup'         { $result = Invoke-MoveGroup -Params $Params }\n    'setGroupScope'     { $result = Invoke-SetGroupScope -Params $Params }\n    'setGroupCategory'  { $result = Invoke-SetGroupCategory -Params $Params }\n    'setGroupDescription' { $result = Invoke-SetGroupDescription -Params $Params }\n\n    default             { throw \"Unknown tool: $tool\" }\n  }\n\n  # Ensure generatedFiles is an array\n  $filesArray = @()\n  if ($result.PSObject.Properties['generatedFiles'] -and $result.generatedFiles) {\n    $filesArray = @($result.generatedFiles)\n  }\n\n  $desc = if ($result.PSObject.Properties['totalTargets']) {\n    \"$($result.tool): $($result.successCount)/$($result.totalTargets) succeeded\"\n  } elseif ($result.PSObject.Properties['totalOperations']) {\n    \"$($result.tool): $($result.successCount)/$($result.totalOperations) succeeded\"\n  } elseif ($result.PSObject.Properties['memberCount']) {\n    \"$($result.tool): $($result.memberCount) members found\"\n  } else {\n    \"$($result.tool) completed successfully\"\n  }\n\n  # Check if result indicates a warning (e.g. partial member failures)\n  $isWarning = $result.PSObject.Properties['warning'] -and $result.warning\n\n  if ($isWarning) {\n    Write-XYWarning -Data $result -Files $filesArray -Description $desc\n  } else {\n    Write-XYSuccess -Data $result -Files $filesArray -Description $desc\n  }\n  exit 0\n}\ncatch {\n  Write-XYError -Code 1 -Description $_.Exception.Message\n  exit 1\n}\n\n#endregion\n",
+        "params": [
+          {
+            "id": "tool",
+            "title": "Tool",
+            "type": "toolset",
+            "caption": "Select a tool.",
+            "locked": false,
+            "data": {
+              "tools": [
+                {
+                  "id": "createGroup",
+                  "title": "Create Group",
+                  "description": "Create a new AD security or distribution group.",
+                  "fields": [
+                    {
+                      "id": "groupName",
+                      "title": "Group Name",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Required. Name of the new group."
+                    },
+                    {
+                      "id": "samAccountName",
+                      "title": "SAM Account Name",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Optional. Auto-generated from group name if empty."
+                    },
+                    {
+                      "id": "displayName",
+                      "title": "Display Name",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Optional. Defaults to group name."
+                    },
+                    {
+                      "id": "groupScope",
+                      "title": "Scope",
+                      "type": "select",
+                      "value": "Global [Global], Universal [Universal], Domain Local [DomainLocal]",
+                      "caption": "Group scope."
+                    },
+                    {
+                      "id": "groupCategory",
+                      "title": "Category",
+                      "type": "select",
+                      "value": "Security [Security], Distribution [Distribution]",
+                      "caption": "Group category."
+                    },
+                    {
+                      "id": "targetOU",
+                      "title": "Target OU",
+                      "type": "text",
+                      "value": "",
+                      "caption": "DN of the OU to create the group in."
+                    },
+                    {
+                      "id": "description",
+                      "title": "Description",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group description."
+                    },
+                    {
+                      "id": "managedBy",
+                      "title": "Managed By",
+                      "type": "text",
+                      "value": "",
+                      "caption": "SamAccountName or DN of the manager."
+                    }
+                  ]
+                },
+                {
+                  "id": "deleteGroup",
+                  "title": "Delete Group",
+                  "description": "Permanently delete group(s) from AD. Defaults to dry-run.",
+                  "fields": [
+                    {
+                      "id": "targetGroups",
+                      "title": "Target Groups",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group name(s) — comma-separated for multiple."
+                    },
+                    {
+                      "id": "dryRun",
+                      "title": "Dry Run",
+                      "type": "checkbox",
+                      "value": true,
+                      "caption": "Preview changes without executing. Disable to actually delete."
+                    }
+                  ]
+                },
+                {
+                  "id": "renameGroup",
+                  "title": "Rename Group",
+                  "description": "Rename or update a group's name, description, or managed-by. Dry-run by default.",
+                  "fields": [
+                    {
+                      "id": "targetGroup",
+                      "title": "Target Group",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Current group name or SAM account."
+                    },
+                    {
+                      "id": "newName",
+                      "title": "New Name (CN)",
+                      "type": "text",
+                      "value": "",
+                      "caption": "New CN name for the group."
+                    },
+                    {
+                      "id": "newSamAccountName",
+                      "title": "New SAM Account",
+                      "type": "text",
+                      "value": "",
+                      "caption": "New SamAccountName."
+                    },
+                    {
+                      "id": "newDisplayName",
+                      "title": "New Display Name",
+                      "type": "text",
+                      "value": "",
+                      "caption": "New display name."
+                    },
+                    {
+                      "id": "description",
+                      "title": "Description",
+                      "type": "text",
+                      "value": "",
+                      "caption": "New description."
+                    },
+                    {
+                      "id": "managedBy",
+                      "title": "Managed By",
+                      "type": "text",
+                      "value": "",
+                      "caption": "SamAccountName or DN of the manager."
+                    },
+                    {
+                      "id": "dryRun",
+                      "title": "Dry Run",
+                      "type": "checkbox",
+                      "value": true,
+                      "caption": "Preview changes without executing."
+                    }
+                  ]
+                },
+                {
+                  "id": "copyGroup",
+                  "title": "Copy Group",
+                  "description": "Create a new group by copying memberships and settings from a template.",
+                  "fields": [
+                    {
+                      "id": "sourceGroup",
+                      "title": "Source Group",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group to copy from (name or SAM)."
+                    },
+                    {
+                      "id": "newGroupName",
+                      "title": "New Group Name",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Required. Name for the new group."
+                    },
+                    {
+                      "id": "newSamAccountName",
+                      "title": "New SAM Account",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Optional. Auto-generated if empty."
+                    },
+                    {
+                      "id": "targetOU",
+                      "title": "Target OU",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Optional. Defaults to same OU as source."
+                    },
+                    {
+                      "id": "description",
+                      "title": "Description",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Optional. Override the copied description."
+                    },
+                    {
+                      "id": "managedBy",
+                      "title": "Managed By",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Optional. Override the copied managed-by."
+                    },
+                    {
+                      "id": "copyMembers",
+                      "title": "Copy Members",
+                      "type": "checkbox",
+                      "value": true,
+                      "caption": "Copy all members to the new group."
+                    }
+                  ]
+                },
+                {
+                  "id": "addMembers",
+                  "title": "Add Members",
+                  "description": "Add users, computers, or groups as members of one or more groups.",
+                  "fields": [
+                    {
+                      "id": "targetGroups",
+                      "title": "Target Groups",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group(s) to add to — comma-separated."
+                    },
+                    {
+                      "id": "members",
+                      "title": "Members",
+                      "type": "text",
+                      "value": "",
+                      "caption": "User/computer/group name(s) — comma-separated."
+                    }
+                  ]
+                },
+                {
+                  "id": "removeMembers",
+                  "title": "Remove Members",
+                  "description": "Remove members from one or more groups. Dry-run by default.",
+                  "fields": [
+                    {
+                      "id": "targetGroups",
+                      "title": "Target Groups",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group(s) to remove from — comma-separated."
+                    },
+                    {
+                      "id": "members",
+                      "title": "Members",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Member name(s) — comma-separated."
+                    },
+                    {
+                      "id": "dryRun",
+                      "title": "Dry Run",
+                      "type": "checkbox",
+                      "value": true,
+                      "caption": "Preview changes without executing."
+                    }
+                  ]
+                },
+                {
+                  "id": "listMembers",
+                  "title": "List Members",
+                  "description": "List all members of a group with type and status.",
+                  "fields": [
+                    {
+                      "id": "targetGroup",
+                      "title": "Target Group",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group name or SAM account."
+                    },
+                    {
+                      "id": "recursive",
+                      "title": "Recursive",
+                      "type": "checkbox",
+                      "value": false,
+                      "caption": "Include members of nested groups."
+                    }
+                  ]
+                },
+                {
+                  "id": "moveGroup",
+                  "title": "Move Group",
+                  "description": "Move group(s) to a different OU. Dry-run by default.",
+                  "fields": [
+                    {
+                      "id": "targetGroups",
+                      "title": "Target Groups",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group name(s) — comma-separated."
+                    },
+                    {
+                      "id": "targetOU",
+                      "title": "Target OU",
+                      "type": "text",
+                      "value": "",
+                      "caption": "DN of the destination OU."
+                    },
+                    {
+                      "id": "dryRun",
+                      "title": "Dry Run",
+                      "type": "checkbox",
+                      "value": true,
+                      "caption": "Preview changes without executing."
+                    }
+                  ]
+                },
+                {
+                  "id": "setGroupScope",
+                  "title": "Set Group Scope",
+                  "description": "Change group scope (Global, Universal, DomainLocal). Dry-run by default.",
+                  "fields": [
+                    {
+                      "id": "targetGroups",
+                      "title": "Target Groups",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group name(s) — comma-separated."
+                    },
+                    {
+                      "id": "newScope",
+                      "title": "New Scope",
+                      "type": "select",
+                      "value": "Global [Global], Universal [Universal], Domain Local [DomainLocal]",
+                      "caption": "New group scope."
+                    },
+                    {
+                      "id": "dryRun",
+                      "title": "Dry Run",
+                      "type": "checkbox",
+                      "value": true,
+                      "caption": "Preview changes without executing."
+                    }
+                  ]
+                },
+                {
+                  "id": "setGroupCategory",
+                  "title": "Set Group Category",
+                  "description": "Toggle group between Security and Distribution. Dry-run by default.",
+                  "fields": [
+                    {
+                      "id": "targetGroups",
+                      "title": "Target Groups",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group name(s) — comma-separated."
+                    },
+                    {
+                      "id": "newCategory",
+                      "title": "New Category",
+                      "type": "select",
+                      "value": "Security [Security], Distribution [Distribution]",
+                      "caption": "New group category."
+                    },
+                    {
+                      "id": "dryRun",
+                      "title": "Dry Run",
+                      "type": "checkbox",
+                      "value": true,
+                      "caption": "Preview changes without executing."
+                    }
+                  ]
+                },
+                {
+                  "id": "setGroupDescription",
+                  "title": "Set Group Description",
+                  "description": "Update description and managed-by on group(s).",
+                  "fields": [
+                    {
+                      "id": "targetGroups",
+                      "title": "Target Groups",
+                      "type": "text",
+                      "value": "",
+                      "caption": "Group name(s) — comma-separated."
+                    },
+                    {
+                      "id": "description",
+                      "title": "Description",
+                      "type": "text",
+                      "value": "",
+                      "caption": "New description text."
+                    },
+                    {
+                      "id": "managedBy",
+                      "title": "Managed By",
+                      "type": "text",
+                      "value": "",
+                      "caption": "SamAccountName or DN of the manager."
+                    },
+                    {
+                      "id": "clearManagedBy",
+                      "title": "Clear Managed By",
+                      "type": "checkbox",
+                      "value": false,
+                      "caption": "Remove the Managed By value."
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "notes": "",
+        "icon": "account-group-outline",
+        "uid": "",
+        "gid": "",
+        "kill": "none",
+        "runner": false
+      }
+    }
+  ]
+}
