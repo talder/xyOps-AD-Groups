@@ -1,4 +1,4 @@
-<p align="center"><img src="https://raw.githubusercontent.com/talder/xyOps-AD-Groups/refs/heads/main/logo.svg" height="108" alt="xyOps AD Groups Logo"/></p>
+<p align="center"><img src="https://raw.githubusercontent.com/talder/xyOps-AD-Groups/refs/heads/main/logo.png" height="108" alt="xyOps AD Groups Logo"/></p>
 <h1 align="center">xyOps AD Groups</h1>
 
 # xyOps Active Directory Groups Event Plugin
